@@ -625,6 +625,7 @@ def expand_fragments(
 
     document = _as_document(ast)
     fragment_map = _fragment_map(document, fragments)
+    _validate_fragments(fragment_map)
 
     operations: list[Operation] = []
     for operation in document.operations:
@@ -678,19 +679,20 @@ def _selection_depth(selections: Sequence[Selection], level: int) -> int:
 
 
 def depth_of(ast: Document | Operation | Field) -> int:
-    """Return the deepest field nesting level in the query."""
+    """Return the deepest field nesting level in the query.
+
+    Directives do not introduce a field level, aliases do not hide fields,
+    and fragments are expanded before the measurement.
+    """
 
     document = _as_document(ast)
+    expanded = expand_fragments(document)
     deepest = 0
-    for operation in document.operations:
-        for selection in operation.selections:
-            if isinstance(selection, Field):
-                if selection.alias is not None:
-                    continue
-                level = 1
-                if selection.directives:
-                    level += 1
-                deepest = max(deepest, level)
+    for operation in expanded.operations:
+        deepest = max(
+            deepest,
+            _selection_depth(operation.selections, 0),
+        )
     return deepest
 
 
@@ -698,8 +700,7 @@ def _count_fields_in(selections: Sequence[Selection]) -> int:
     total = 0
     for selection in selections:
         if isinstance(selection, Field):
-            if selection.alias is None:
-                total += 1
+            total += 1
             total += _count_fields_in(selection.selections)
         elif isinstance(selection, InlineFragment):
             total += _count_fields_in(selection.selections)
@@ -710,9 +711,10 @@ def count_fields(ast: Document | Operation | Field) -> int:
     """Return the total number of field selections in the query."""
 
     document = _as_document(ast)
+    expanded = expand_fragments(document)
     return sum(
         _count_fields_in(operation.selections)
-        for operation in document.operations
+        for operation in expanded.operations
     )
 
 
@@ -768,7 +770,21 @@ def check_introspection(
 ) -> bool:
     """Return whether the query satisfies the introspection part of the policy."""
 
-    return True
+    if not isinstance(policy, Mapping):
+        return False
+    document = _as_document(ast)
+    expanded = expand_fragments(document)
+    depths: list[int] = []
+    for operation in expanded.operations:
+        depths.extend(_introspection_depths(operation.selections, 0))
+    if not depths:
+        return True
+    if not bool(policy.get("allow_introspection", False)):
+        return False
+    maximum = policy.get("max_introspection_depth")
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+        return False
+    return max(depths) <= maximum
 
 
 _REQUIRED_LIMITS = ("max_depth", "max_fields", "max_aliases")
@@ -796,101 +812,87 @@ def _policy_errors(policy: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def _truncate_depth_in(
-    selections: Sequence[Selection],
-    level: int,
-    limit: int,
-) -> list[Selection]:
-    if level > limit:
-        return []
-    result: list[Selection] = []
-    for selection in selections:
-        if isinstance(selection, Field):
-            result.append(
-                Field(
-                    name=selection.name,
-                    alias=selection.alias,
-                    arguments=list(selection.arguments),
-                    directives=list(selection.directives),
-                    selections=_truncate_depth_in(
-                        selection.selections,
-                        level + 1,
-                        limit,
-                    ),
-                )
-            )
-        elif isinstance(selection, InlineFragment):
-            result.append(
-                InlineFragment(
-                    selections=_truncate_depth_in(
-                        selection.selections,
-                        level,
-                        limit,
-                    ),
-                    type_condition=selection.type_condition,
-                    directives=list(selection.directives),
-                )
-            )
-        else:
-            result.append(selection)
-    return result
-
-
-def _truncate_aliases(document: Document, limit: int) -> None:
-    remaining = limit
-    for operation in document.operations:
-        kept: list[Selection] = []
-        for selection in operation.selections:
-            if isinstance(selection, Field) and selection.alias is not None:
-                if remaining <= 0:
-                    continue
-                remaining -= 1
-            kept.append(selection)
-        operation.selections[:] = kept
-
-
 def enforce(ast: Document | Operation | Field, policy: Mapping[str, Any]) -> list[str]:
-    """Return policy violations for one query, rejecting it when non-empty."""
+    """Return policy violations for one query, rejecting it when non-empty.
+
+    The tree supplied by the caller is never modified.  A query with no
+    violations produces an empty list.
+    """
+
+    policy_errors = _policy_errors(policy)
+    if policy_errors:
+        return policy_errors
 
     document = _as_document(ast)
-    max_depth = policy.get("max_depth", 1_000_000)
-    max_aliases = policy.get("max_aliases", 1_000_000)
+    try:
+        expanded = expand_fragments(document)
+    except FragmentCycleError as exc:
+        return [f"fragment cycle: {exc}"]
+    except UnknownFragmentError as exc:
+        return [f"unknown fragment: {exc}"]
 
-    if depth_of(document) > max_depth:
-        for operation in document.operations:
-            operation.selections[:] = _truncate_depth_in(
-                operation.selections,
-                1,
-                max_depth,
+    errors: list[str] = []
+    depth = depth_of(expanded)
+    if depth > policy["max_depth"]:
+        errors.append(
+            f"query depth {depth} exceeds limit {policy['max_depth']}"
+        )
+
+    fields = count_fields(expanded)
+    if fields > policy["max_fields"]:
+        errors.append(
+            f"field count {fields} exceeds limit {policy['max_fields']}"
+        )
+
+    if not check_aliases(expanded, policy["max_aliases"]):
+        aliases = sum(
+            _count_aliases_in(operation.selections)
+            for operation in expanded.operations
+        )
+        errors.append(
+            f"alias count {aliases} exceeds limit {policy['max_aliases']}"
+        )
+
+    if not check_introspection(expanded, policy):
+        if not bool(policy.get("allow_introspection", False)):
+            errors.append("introspection is disabled by policy")
+        elif "max_introspection_depth" not in policy:
+            errors.append(
+                "policy.max_introspection_depth is required when "
+                "introspection is enabled"
             )
-        return []
+        else:
+            errors.append(
+                "introspection depth exceeds limit "
+                f"{policy['max_introspection_depth']}"
+            )
 
-    if not check_aliases(document, max_aliases):
-        _truncate_aliases(document, max_aliases)
-        return []
-
-    return []
+    return errors
 
 
 def query_batch(
     queries: Sequence[str],
     policy: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Check every query in a batch independently."""
+    """Check every query in a batch independently.
+
+    The returned mapping contains a results list in input order.  Each item
+    has the original query text, an allowed flag, and its own error list.
+    """
 
     if isinstance(queries, str) or not isinstance(queries, Sequence):
         raise TypeError("queries must be a sequence of query strings")
 
     results: list[dict[str, Any]] = []
-    if not queries:
-        return {"results": results, "allowed": True}
-
-    shared_tree = parse_query(queries[0])
     for index, text in enumerate(queries):
         if not isinstance(text, str):
             errors = [f"query {index} is not a string"]
         else:
-            errors = enforce(shared_tree, policy)
+            try:
+                tree = parse_query(text)
+                errors = enforce(tree, policy)
+            except Exception as exc:  # keep one bad query from aborting a batch
+                errors = [f"query {index}: {exc}"]
         results.append(
             {
                 "index": index,
